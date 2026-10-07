@@ -1,0 +1,24 @@
+pyrealsense2
+numpy
+opencv-python
+Pillow
+psutil          # CPU clock-speed / utilization diagnostics (see main.py)
+
+# --- Object detection (see yolo_detector.py) ---
+# Optional in the sense that the app degrades gracefully without these —
+# the Detection status dot just reports "unavailable" and everything else
+# keeps working normally — but needed for detection to actually run.
+ultralytics>=8.4.0    # >=8.4.0 required for YOLO26 (yolo26n.pt) support
+torch                 # required by ultralytics; install the CUDA build for
+                       # your GPU from https://pytorch.org/get-started/locally/
+                       # — a plain "pip install torch" can silently resolve
+                       # to a CPU-only wheel depending on platform/Python
+                       # version, which is the single most common cause of
+                       # "why is it running on CPU" for this kind of setup.
+
+# --- TensorRT (optional — real speedup, not required) ---
+# yolo_detector.py automatically falls back to plain CUDA with no crash and
+# no manual step if this isn't installed or the export fails for any
+# reason. Install via NVIDIA's own instructions for your exact CUDA
+# version: https://docs.nvidia.com/deeplearning/tensorrt/install-guide/
+# tensorrt
