@@ -420,5 +420,3 @@ crashing anything else.
 | `ui/widgets.py`               | reusable stat card / bar gauge / attitude-indicator widgets |
 | `ui/theme.py`                 | shared colors/fonts                                          |
 | `main.py`                    | wires camera + IMU + YOLO workers together, entry point     |
-#   t r a c t o r _ a u t o p i l o t  
- 
