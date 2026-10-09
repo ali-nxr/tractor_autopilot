@@ -81,6 +81,12 @@ class _GroundGrid:
         self.nz = int(np.ceil(z_max / cell)) + 1
         x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
         m = valid & ~raised & (np.abs(x) < x_lim) & (z > 0) & (z < z_max)
+        # `raised` holds CONFIRMED obstacles only, so unconfirmed off-ground
+        # points (bushes, depth noise, sky-stereo garbage) would otherwise be
+        # averaged in as "ground height" and lift a ribbon edge into the air
+        # — measured as ribbon spikes of up to 380 px on recorded footage.
+        a, b, c, d = plane
+        m &= np.abs(a * x + b * y + c * z + d) < config.AR_GROUND_MAX_DEV_M
         ix = ((x[m] + x_lim) / cell).astype(np.int64)
         iz = (z[m] / cell).astype(np.int64)
         key = iz * self.nx + ix
@@ -115,6 +121,8 @@ class ArRibbon:
     def reset(self):
         self._x_prev = None     # smoothed centerline x on self._grid (NaN = unset)
         self._end_prev = None   # smoothed far-end distance
+        self._last = None       # last drawn ribbon, held through brief planner dropouts
+        self._held = 0
 
     def update(self, path_result, xyz, valid, raised, plane, intrinsics):
         stop_z = path_result.get("blocked_at_m")
@@ -122,8 +130,16 @@ class ArRibbon:
         base = {"valid": False, "no_path": stop_z is not None and len(wm) < 2,
                 "stop_z": stop_z, "occlusion": raised}
         if plane is None or len(wm) < 2:
+            # A one-or-two-frame planner dropout with NOTHING blocking (no
+            # path found for lack of data) re-uses the last ribbon instead of
+            # blinking off and discarding the smoothing state. A real block
+            # (stop_z set) is never held over — that clears immediately.
+            if stop_z is None and self._last is not None and self._held < config.AR_HOLD_DROPOUT_FRAMES:
+                self._held += 1
+                return self._last
             self.reset()
             return base
+        self._held = 0
 
         zw = np.array([p[1] for p in wm]); xw = np.array([p[0] for p in wm])
         z0 = zw[0]
@@ -169,4 +185,5 @@ class ArRibbon:
             stop_line = (pl, pr)
 
         base.update(valid=True, left=left, right=right, z=zs, stop_line=stop_line, no_path=False)
+        self._last = base
         return base

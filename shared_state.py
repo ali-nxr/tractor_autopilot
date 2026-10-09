@@ -53,6 +53,10 @@ class SharedState:
         self.yolo_detections = []
         self.yolo_status = "not started"
 
+        # --- debug view (config.DEBUG only; see debug_view.py) ---
+        self.debug_frame = None          # BGR panel grid
+        self.debug_probe = None          # per-pixel values behind it, for the mouse readout
+
         # --- rolling history for small live trend sparklines ---
         n = config.HISTORY_LENGTH
         self.history = {
@@ -94,6 +98,15 @@ class SharedState:
             self.yolo_detections = detections
             if status is not None:
                 self.yolo_status = status
+
+    def update_debug(self, frame, probe):
+        with self._lock:
+            self.debug_frame = frame
+            self.debug_probe = probe
+
+    def get_debug(self):
+        with self._lock:
+            return self.debug_frame, self.debug_probe
 
     def get_yolo_detections(self):
         """Thread-safe snapshot — called from the vision thread every

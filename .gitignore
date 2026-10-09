@@ -1,3 +1,6 @@
 *.pyc
 *.pt
 *.onnx
+models/trt_cache/
+
+recordings/

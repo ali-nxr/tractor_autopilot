@@ -35,7 +35,7 @@ RECORDING_DIR = r"D:\tractor_realsense_data"
 # Which sequence to play. None = pick automatically (see PREFER below).
 # Otherwise: a full path, a folder index ("0", "1"), or any part of the
 # file name ("145904"). The --file command-line argument overrides this.
-SEQUENCE = None
+SEQUENCE = 145707
 # Used only when SEQUENCE is None: "longest" (most footage to look at),
 # "first", or "last".
 PREFER = "longest"

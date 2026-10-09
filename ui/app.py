@@ -44,12 +44,34 @@ class TractorVisionApp:
         self._build_bottom_bar()
         self._build_middle(on_imu_zero=on_imu_zero)
 
+        # Second window with raw depth / SegFormer output (config.DEBUG).
+        self._debug_window = None
+        if config.DEBUG:
+            from ui.debug_window import DebugWindow
+            self._debug_window = DebugWindow(self.root, shared_state)
+
+        # Video of the HUD (+ debug window) into config.RECORD_VIDEO_DIR.
+        self._recorder = None
+        if config.RECORD_VIDEO:
+            from ui.screen_recorder import AppRecorder
+            sources = [("hud", lambda: self.root)]
+            if self._debug_window is not None:
+                sources.append(("debug", lambda: (None if self._debug_window.closed
+                                                  else self._debug_window.top)))
+            self._recorder = AppRecorder(self.root, sources)
+            # Started from _tick() once the first processed frame is on
+            # screen — not on a timer, or every video would open with the
+            # empty startup UI while the camera/models are still loading.
+
         self._tick()
 
     def run(self):
         self.root.mainloop()
 
     def _handle_close(self):
+        # Finalize the video files first, while the windows still exist.
+        if self._recorder is not None:
+            self._recorder.stop()
         if self.on_close:
             self.on_close()
         self.root.destroy()
@@ -343,6 +365,8 @@ class TractorVisionApp:
             rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
             self._video_tk_image = ImageTk.PhotoImage(image=Image.fromarray(rgb))
             self.video_label.configure(image=self._video_tk_image)
+            if self._recorder is not None and not self._recorder.started:
+                self._recorder.start()
 
         # --- top bar ---
         self.fps_label.configure(text=f"{snap['fps']:.1f} FPS")
@@ -412,5 +436,8 @@ class TractorVisionApp:
             if self._degraded_visible:
                 self.degraded_banner.pack_forget()
                 self._degraded_visible = False
+
+        if self._debug_window is not None:
+            self._debug_window.refresh()
 
         self.root.after(config.UPDATE_INTERVAL_MS, self._tick)

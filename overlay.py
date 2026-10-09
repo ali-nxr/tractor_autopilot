@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 
 import config
+import config_segformer
 from obstacle_decision import brake_color
 
 
@@ -38,12 +39,14 @@ def _blend_masked(frame, mask_bool, color, alpha):
 def draw_annotations(color_image, land_mask, boundary_contour, corridor_mask,
                       obstacles, brake_percent, steer_suggestion_deg, path_result,
                       speed_mps=0.0, confidence_mask=None, raw_valid_mask=None,
-                      ribbon=None):
+                      ribbon=None, semantic_mask=None):
     """
     ribbon=None -> legacy look (flat surface polygon + center line + text).
     ribbon=<ar_ribbon.ArRibbon.update() result> -> the AR look: smooth
     ground-hugging ribbon, wheel-line edges, ground distance stripes, STOP
     line, occlusion, and the declutter switches in config (AR_SHOW_*).
+    semantic_mask=<bool mask> -> thin outline of what SegFormer alone calls
+    driveable (config_segformer.SEMANTIC_SHOW_OVERLAY), for tuning.
     """
     frame = color_image.copy()
     h, w = frame.shape[:2]
@@ -65,6 +68,13 @@ def draw_annotations(color_image, land_mask, boundary_contour, corridor_mask,
     # --- land boundary ---
     if boundary_contour is not None and (not ar or config.AR_SHOW_LAND_BOUNDARY):
         cv2.drawContours(frame, [boundary_contour], -1, config.COLOR_LAND_BOUNDARY, 1 if ar else 2,
+                         cv2.LINE_AA)
+
+    # --- SegFormer driveable outline (tuning aid, off by default) ---
+    if semantic_mask is not None and semantic_mask.any():
+        sem_contours, _ = cv2.findContours((semantic_mask.astype(np.uint8)) * 255,
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(frame, sem_contours, -1, config_segformer.COLOR_SEMANTIC_OUTLINE, 1,
                          cv2.LINE_AA)
 
     # --- corridor outline ---

@@ -124,9 +124,11 @@ def _upsample_mask_nearest(mask, full_w, full_h, downscale):
 
 
 import config
+import config_segformer
 from shared_state import SharedState
 from realsense_capture import RealSenseCapture
 from ground_segmentation import GroundSegmenter
+from segformer_onnx import SegformerOnnx
 import obstacle_decision
 import path_planner
 import overlay
@@ -135,6 +137,7 @@ from smoothing import SlewRateLimiter
 from object_tracker import ObstacleTracker
 from camera_pipeline import CameraCapturePipeline
 from yolo_detector import AgriYoloDetector, draw_detections
+import debug_view
 import vehicle_profile
 from ar_ribbon import ArRibbon
 from ui.app import TractorVisionApp
@@ -366,12 +369,19 @@ class VisionWorker:
         capture_pipeline.start()
 
         ground_segmenter = GroundSegmenter()
+        # SegFormer driveable-ground model (onnxruntime) — guides the depth
+        # segmentation; see config_segformer.py. Unavailable -> None maps ->
+        # pure-depth segmentation, exactly as before.
+        semantic_model = SegformerOnnx()
+        if not semantic_model.available:
+            print(f"[segformer] unavailable — pure-depth ground segmentation: {semantic_model.error}")
         speed_estimator = SpeedEstimator()
         brake_smoother = SlewRateLimiter(config.MAX_BRAKE_CHANGE_PCT_PER_S)
         steer_smoother = SlewRateLimiter(config.MAX_STEER_CHANGE_DEG_PER_S)
         obstacle_tracker = ObstacleTracker()
         ar_ribbon = ArRibbon()  # stateful: anti-jitter across frames
         last_frame_time = time.time()
+        debug_frame_index = 0
 
         # Perception watchdog: tracks how long perception has been
         # continuously degraded — either no ground plane found, OR a plane
@@ -394,6 +404,7 @@ class VisionWorker:
         # are not independent), and was removed rather than shipped
         # half-finished with a comment that didn't match what it did.
         _cap_time_sum = 0.0
+        _sem_time_sum = 0.0
         _seg_time_sum = 0.0
         _speed_time_sum = 0.0
         _obs_time_sum = 0.0
@@ -442,11 +453,23 @@ class VisionWorker:
                 depth_image_m, xyz, raw_valid_mask, ir_image, pd
             )
 
+            proc_h, proc_w = depth_proc.shape[:2]
+            semantic_prob_proc = semantic_model.driveable_probability(
+                color_image, (proc_w, proc_h), want_class_ids=config.DEBUG)
+            # Stereo depth on featureless sky is garbage (phantom "obstacles"
+            # 1-2 m away, 1+ m up) — see SEMANTIC_SKY_MASK_ENABLED.
+            sky_proc = semantic_model.sky_mask((proc_w, proc_h))
+            if sky_proc is not None:
+                valid_proc = valid_proc & ~sky_proc
+            _t1s = time.perf_counter()
+            _sem_time_sum += (_t1s - _t1)
+
             seg = ground_segmenter.segment(
-                depth_proc, xyz_proc, ir_image=ir_proc, raw_valid_mask=valid_proc
+                depth_proc, xyz_proc, ir_image=ir_proc, raw_valid_mask=valid_proc,
+                semantic_prob=semantic_prob_proc,
             )
             _t2 = time.perf_counter()
-            _seg_time_sum += (_t2 - _t1)
+            _seg_time_sum += (_t2 - _t1s)
             land_mask_proc = seg["land_mask"]
             boundary_contour_proc = seg["boundary_contour"]
             dist_to_plane_proc = seg["dist_to_plane"]
@@ -564,6 +587,17 @@ class VisionWorker:
                 else boundary_contour_proc
             )
 
+            # The low-confidence overlay marks depth the SENSOR could not
+            # trust (raw_valid but rejected) — masked sky is a deliberate
+            # rejection, not a sensor problem, so keep it out of that overlay.
+            raw_valid_display = raw_valid_mask
+            if sky_proc is not None and raw_valid_mask is not None:
+                raw_valid_display = raw_valid_mask & ~_upsample_mask_nearest(sky_proc, full_w, full_h, pd)
+
+            semantic_mask_full = None
+            if config_segformer.SEMANTIC_SHOW_OVERLAY and seg["semantic_ground"] is not None:
+                semantic_mask_full = _upsample_mask(seg["semantic_ground"], full_w, full_h, pd)
+
             # AR ribbon geometry (display only — never feeds brake/steer)
             ribbon = None
             if config.AR_ENABLED:
@@ -573,8 +607,8 @@ class VisionWorker:
             annotated = overlay.draw_annotations(
                 color_image, land_mask_full, boundary_contour_full, corridor_mask_full,
                 display_obstacles, brake_percent, steer_deg, path_result, speed_mps=speed_mps,
-                confidence_mask=confidence_mask_full, raw_valid_mask=raw_valid_mask,
-                ribbon=ribbon,
+                confidence_mask=confidence_mask_full, raw_valid_mask=raw_valid_display,
+                ribbon=ribbon, semantic_mask=semantic_mask_full,
             )
             if watchdog_triggered:
                 overlay.draw_watchdog_banner(annotated, degraded_duration)
@@ -588,6 +622,13 @@ class VisionWorker:
             if self.yolo_worker is not None:
                 self.yolo_worker.submit_frame(color_image)
                 draw_detections(annotated, self.state.get_yolo_detections())
+
+            if config.DEBUG:
+                if debug_frame_index % max(1, config.DEBUG_UPDATE_EVERY_N_FRAMES) == 0:
+                    self.state.update_debug(*debug_view.build(
+                        color_image, depth_image_m, raw_valid_mask, xyz_proc, seg,
+                        semantic_prob_proc, semantic_model))
+                debug_frame_index += 1
 
             _t6 = time.perf_counter()
             _overlay_time_sum += (_t6 - _t5)
@@ -621,14 +662,15 @@ class VisionWorker:
             _frame_count += 1
             if _frame_count >= 10:
                 cap_ms = _cap_time_sum / _frame_count * 1000
+                sem_ms = _sem_time_sum / _frame_count * 1000
                 seg_ms = _seg_time_sum / _frame_count * 1000
                 speed_ms = _speed_time_sum / _frame_count * 1000
                 obs_ms = _obs_time_sum / _frame_count * 1000
                 path_ms = _path_time_sum / _frame_count * 1000
                 overlay_ms = _overlay_time_sum / _frame_count * 1000
                 state_ms = _state_update_time_sum / _frame_count * 1000
-                total_ms = cap_ms + seg_ms + speed_ms + obs_ms + path_ms + overlay_ms + state_ms
-                line = (f"[timing] capture={cap_ms:.1f}  segment={seg_ms:.1f}  speed_est={speed_ms:.1f}  "
+                total_ms = cap_ms + sem_ms + seg_ms + speed_ms + obs_ms + path_ms + overlay_ms + state_ms
+                line = (f"[timing] capture={cap_ms:.1f}  semantic={sem_ms:.1f}  segment={seg_ms:.1f}  speed_est={speed_ms:.1f}  "
                         f"obstacles={obs_ms:.1f}  path_plan={path_ms:.1f}  overlay={overlay_ms:.1f}  "
                         f"state_update={state_ms:.1f}  (all ms/frame)  TOTAL={total_ms:.1f}ms/frame "
                         f"(~{1000/total_ms:.1f} FPS)")
@@ -643,6 +685,7 @@ class VisionWorker:
                 line += f"  running_on_core={_current_core_index()}"
                 print(line)
                 _cap_time_sum = 0.0
+                _sem_time_sum = 0.0
                 _seg_time_sum = 0.0
                 _speed_time_sum = 0.0
                 _obs_time_sum = 0.0

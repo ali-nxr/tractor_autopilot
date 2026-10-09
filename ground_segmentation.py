@@ -28,12 +28,20 @@ real segmentation accuracy:
      per-pixel probability, not just the plane) — this is what actually
      removes frame-to-frame flicker at the boundary: a single noisy frame
      can only nudge a pixel's probability, not flip its classification.
+  6. Optional semantic guidance (SegFormer, see segformer_onnx.py and
+     config_segformer.py): a per-pixel "driveable ground" probability seeds
+     the plane fit with real ground only, admits rough terrain the strict
+     single-plane test rejects, and vetoes flat non-ground. Never lets land
+     absorb a pixel tall enough to be an obstacle. Without it (model
+     disabled / unavailable), behavior is exactly the pure-depth version.
 """
 
 import numpy as np
 import cv2
 
 import config
+import config_segformer as scfg
+from obstacle_decision import height_threshold_m, open_raised
 
 
 def build_confidence_mask(raw_valid_mask, ir_image):
@@ -254,6 +262,53 @@ def _light_speckle_removal(mask):
     return mask_u8 > 0
 
 
+def _structural_raised(dist_to_plane, valid_depth, xyz):
+    """
+    Raised pixels that SURVIVE the obstacle detector's own speckle removal
+    (obstacle_decision.open_raised) — the only raised pixels that can ever
+    belong to an obstacle blob. Every other raised pixel is isolated depth
+    noise, which on rough ground is what punches flickering holes into the
+    land mask.
+    """
+    raised_all = valid_depth & (dist_to_plane > height_threshold_m(xyz[..., 2]))
+    return open_raised(raised_all) > 0
+
+
+def _fuse_semantic(geo_land, sem_prob, semantic_ground, dist_to_plane, valid_depth, xyz, cos_angle,
+                   structural_raised):
+    """
+    Combines the strict geometric land test with SegFormer's per-pixel
+    driveable probability (see config_segformer.py):
+
+      land = (geo_land AND NOT confidently-non-ground)
+          OR (semantic ground AND valid depth AND not part of a raised
+              structure AND within the relaxed normal angle)
+
+    SEMANTIC_ABSORB_DEPTH_SPECKLE = True: "not part of a raised structure"
+    means not in structural_raised, so isolated over-threshold noise pixels
+    on semantic ground count as land. False: the stricter rule — below
+    min(height_threshold_m(z), SEMANTIC_GROUND_MAX_HEIGHT_M).
+
+    Either way the obstacle output is unchanged: land never takes a pixel
+    that survives obstacle_decision.open_raised, and opening is monotone and
+    idempotent, so the opened raised mask detect_obstacle_blobs labels is
+    identical with or without these pixels. The veto only removes land.
+    """
+    land = geo_land
+    if scfg.SEMANTIC_VETO_ENABLED:
+        land = land & (sem_prob >= scfg.SEMANTIC_VETO_MAX_PROB)
+
+    if scfg.SEMANTIC_ABSORB_DEPTH_SPECKLE:
+        relaxed = semantic_ground & valid_depth & ~structural_raised
+    else:
+        tolerance = np.minimum(height_threshold_m(xyz[..., 2]), scfg.SEMANTIC_GROUND_MAX_HEIGHT_M)
+        relaxed = semantic_ground & valid_depth & (dist_to_plane < tolerance)
+    if cos_angle is not None and scfg.SEMANTIC_NORMAL_MAX_ANGLE_DEG is not None:
+        relaxed &= cos_angle > np.cos(np.deg2rad(scfg.SEMANTIC_NORMAL_MAX_ANGLE_DEG))
+
+    return land | relaxed
+
+
 def _extract_boundary(land_mask):
     mask_u8 = (land_mask.astype(np.uint8)) * 255
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -278,9 +333,16 @@ class GroundSegmenter:
         self._smoothed_plane = None
         self._miss_count = 0
         self._land_prob = None   # running per-pixel EMA of the land classification
+        self._land_state = None  # last thresholded mask (hysteresis memory)
+        self._semantic_prob = None   # running per-pixel EMA of the SegFormer driveable probability
 
-    def segment(self, depth_image_m, xyz, ir_image=None, raw_valid_mask=None):
+    def segment(self, depth_image_m, xyz, ir_image=None, raw_valid_mask=None, semantic_prob=None):
         """
+        semantic_prob : optional (H, W) float32 in [0, 1] — SegFormer's
+                        driveable-ground probability at this same resolution
+                        (segformer_onnx.SegformerOnnx.driveable_probability).
+                        None = pure-depth segmentation, unchanged.
+
         Returns dict with:
           land_mask         : (H, W) bool — cleaned, largest-blob land region
           boundary_contour   : Nx1x2 int32 array (image coords) or None
@@ -289,6 +351,11 @@ class GroundSegmenter:
           dist_to_plane      : (H, W) float32, meters
           valid_depth        : (H, W) bool
           confidence_mask    : (H, W) bool or None
+          semantic_ground    : (H, W) bool or None — what the model alone calls driveable
+          semantic_seeded    : bool — this frame's plane was seeded from semantic ground only
+          semantic_prob      : (H, W) float32 or None — the temporally SMOOTHED map actually used
+          geo_land_raw       : (H, W) bool or None — the strict geometric test alone, before
+                               semantic fusion and cleanup (debug view: what semantics added/vetoed)
         """
         h, w = depth_image_m.shape
         valid_depth = depth_image_m > 0.05
@@ -297,6 +364,9 @@ class GroundSegmenter:
         if confidence_mask is not None:
             valid_depth = valid_depth & confidence_mask
 
+        sem_prob = self._smooth_semantic(semantic_prob, (h, w))
+        semantic_ground = None if sem_prob is None else sem_prob > scfg.SEMANTIC_GROUND_MIN_PROB
+
         seed_row_start = int(h * (1.0 - config.GROUND_SEED_ROW_FRACTION))
         # Slice the row range first (a cheap view, not a copy) and only
         # fancy-index the boolean valid_depth mask within that smaller
@@ -304,7 +374,21 @@ class GroundSegmenter:
         # fancy-indexing the whole frame — measurably faster.
         xyz_seed_rows = xyz[seed_row_start:, :]
         valid_seed_rows = valid_depth[seed_row_start:, :]
-        seed_points = xyz_seed_rows[valid_seed_rows]
+        seed_points = None
+        semantic_seeded = False
+        if sem_prob is not None and scfg.SEMANTIC_SEED_ENABLED:
+            # Seed only from what the model calls ground, so the plane is
+            # fit to the ground itself rather than to a crop row, a vehicle
+            # or a wall that happens to fill the bottom of the frame.
+            # Too few such points (looking at a hedge, a dropout) -> fall
+            # back to the unrestricted seed set below.
+            sem_seed_rows = sem_prob[seed_row_start:, :] > scfg.SEMANTIC_SEED_MIN_PROB
+            candidate = xyz_seed_rows[valid_seed_rows & sem_seed_rows]
+            if candidate.shape[0] >= config.RANSAC_MIN_SAMPLE_POINTS:
+                seed_points = candidate
+                semantic_seeded = True
+        if seed_points is None:
+            seed_points = xyz_seed_rows[valid_seed_rows]
         raw_plane = _fit_plane_ransac_vectorized(seed_points, self._rng)
         plane = self._smooth_plane(raw_plane)
 
@@ -322,6 +406,10 @@ class GroundSegmenter:
                 "dist_to_plane": np.zeros((h, w), dtype=np.float32),
                 "valid_depth": valid_depth,
                 "confidence_mask": confidence_mask,
+                "semantic_ground": semantic_ground,
+                "semantic_seeded": semantic_seeded,
+                "semantic_prob": sem_prob,
+                "geo_land_raw": None,
             }
 
         a, b, c, d = plane
@@ -332,11 +420,20 @@ class GroundSegmenter:
 
         raw_land_mask = (dist_to_plane < config.RANSAC_INLIER_THRESHOLD_M) & valid_depth
 
+        cos_angle = None
         if config.NORMAL_CONSISTENCY_ENABLED:
             surface_normals = _compute_surface_normals(xyz, config.NORMAL_COMPUTE_DOWNSCALE)
             cos_angle = np.abs(surface_normals @ plane_normal)
             angle_ok = cos_angle > np.cos(np.deg2rad(config.NORMAL_MAX_ANGLE_DEG))
             raw_land_mask &= angle_ok
+
+        geo_land_raw = raw_land_mask
+        structural_raised = None
+        if sem_prob is not None:
+            structural_raised = _structural_raised(dist_to_plane, valid_depth, xyz)
+            raw_land_mask = _fuse_semantic(raw_land_mask, sem_prob, semantic_ground,
+                                           dist_to_plane, valid_depth, xyz, cos_angle,
+                                           structural_raised)
 
         land_mask = _clean_and_take_largest_blob(raw_land_mask, downscale=config.SEGMENTATION_DOWNSCALE)
 
@@ -353,6 +450,18 @@ class GroundSegmenter:
         # Morphological closing can patch a genuinely untrusted hole back
         # into "land" — re-punch out anything confidence/validity rejected.
         land_mask &= valid_depth
+        if sem_prob is not None:
+            # Semantic land reaches right up to the base of an obstacle, so
+            # the morphological CLOSE / temporal smoothing above could
+            # bridge into a raised fringe — re-punch it, so the obstacle
+            # output stays exactly what geometry alone says. With
+            # SEMANTIC_ABSORB_DEPTH_SPECKLE only raised STRUCTURES are
+            # punched (see _fuse_semantic for why that is equivalent for
+            # obstacles); otherwise every over-threshold pixel is.
+            if scfg.SEMANTIC_ABSORB_DEPTH_SPECKLE:
+                land_mask &= ~structural_raised
+            else:
+                land_mask &= dist_to_plane <= height_threshold_m(xyz[..., 2])
         boundary_contour = _extract_boundary(land_mask)
 
         return {
@@ -363,7 +472,30 @@ class GroundSegmenter:
             "dist_to_plane": dist_to_plane,
             "valid_depth": valid_depth,
             "confidence_mask": confidence_mask,
+            "semantic_ground": semantic_ground,
+            "semantic_seeded": semantic_seeded,
+            "semantic_prob": sem_prob,
+            "geo_land_raw": geo_land_raw,
         }
+
+    def _smooth_semantic(self, semantic_prob, shape):
+        """
+        EMA over the model's probability map (SEMANTIC_TEMPORAL_ALPHA),
+        before it is thresholded anywhere — an uncertain pixel near 0.5
+        cannot flicker in and out of "ground" frame to frame. A missing map
+        (model failed this frame) clears the history rather than coasting on
+        a stale one; a shape change does the same.
+        """
+        if semantic_prob is None or semantic_prob.shape != shape:
+            self._semantic_prob = None
+            return None
+        alpha = scfg.SEMANTIC_TEMPORAL_ALPHA
+        frame_p = semantic_prob.astype(np.float32, copy=False)
+        if self._semantic_prob is None:
+            self._semantic_prob = frame_p.copy()
+        else:
+            self._semantic_prob = alpha * frame_p + (1.0 - alpha) * self._semantic_prob
+        return self._semantic_prob
 
     def _smooth_land_mask(self, frame_land_mask):
         """
@@ -378,10 +510,18 @@ class GroundSegmenter:
 
         if self._land_prob is None or self._land_prob.shape != frame_f.shape:
             self._land_prob = frame_f
-        else:
-            self._land_prob = alpha * frame_f + (1.0 - alpha) * self._land_prob
+            self._land_state = self._land_prob > 0.5
+            return self._land_state
 
-        return self._land_prob > 0.5
+        self._land_prob = alpha * frame_f + (1.0 - alpha) * self._land_prob
+        # Hysteresis (LAND_MASK_HYSTERESIS): a pixel turns ON above 0.5+h
+        # and OFF below 0.5-h, keeping its previous state in between — so a
+        # pixel whose probability hovers near 0.5 cannot toggle every frame.
+        h = config.LAND_MASK_HYSTERESIS
+        self._land_state = np.where(self._land_state,
+                                    self._land_prob > 0.5 - h,
+                                    self._land_prob > 0.5 + h)
+        return self._land_state
 
     def _smooth_plane(self, raw_plane):
         if not config.PLANE_TEMPORAL_SMOOTHING_ENABLED:

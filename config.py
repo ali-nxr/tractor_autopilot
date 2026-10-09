@@ -109,8 +109,18 @@ PLANE_TEMPORAL_SMOOTHING_ALPHA = 0.35
 PLANE_COAST_MAX_MISSES = 6           # frames to keep the last good plane through a brief dropout
 
 # Smooths the classified MASK itself (not just the plane) — removes the
-# frame-to-frame flicker at the land boundary.
-LAND_MASK_TEMPORAL_SMOOTHING_ALPHA = 0.45
+# frame-to-frame flicker at the land boundary. Lowered 0.45 -> 0.3 together
+# with LAND_MASK_HYSTERESIS below, tuned on two recorded field sequences:
+# frame-to-frame land-mask IoU 0.92 -> 0.96 (matching SegFormer's own mask
+# stability). Cost: a pixel needs 4 consecutive frames of consistent
+# evidence to flip (was 2). Display/coverage only — obstacle detection was
+# verified identical frame for frame.
+LAND_MASK_TEMPORAL_SMOOTHING_ALPHA = 0.3
+# Hysteresis on that smoothed probability: a pixel becomes land above
+# 0.5 + this and stops being land below 0.5 - this, otherwise it keeps its
+# previous state — a pixel hovering near 0.5 can't toggle every frame.
+# 0 = plain 0.5 threshold.
+LAND_MASK_HYSTERESIS = 0.2
 
 MORPH_KERNEL_SIZE = 7
 MIN_LAND_BLOB_AREA_PX = 4000
@@ -308,6 +318,9 @@ AR_STOP_GAP_M = 0.4               # ribbon ends this far before a blocking point
 AR_ALPHA_NEAR = 0.55              # surface opacity near the tractor ...
 AR_ALPHA_FAR = 0.20               # ... fading to this at the far end
 AR_WARN_RAMP_M = 3.0              # ribbon turns amber over this distance before a STOP
+AR_GROUND_MAX_DEV_M = 0.30        # ribbon ground-height grid ignores points further than this from the plane
+AR_HOLD_DROPOUT_FRAMES = 3        # keep the last ribbon this many frames when the planner briefly finds no path
+                                  # (never when it is BLOCKED — that clears at once)
 COLOR_AR_EDGE = (255, 245, 210)   # crisp wheel-line edges + major stripes (BGR)
 COLOR_AR_GLOW = (255, 230, 150)
 COLOR_AR_STRIPE = (255, 210, 150)
@@ -324,6 +337,30 @@ COLOR_PATH_WARN = (0, 165, 255)
 COLOR_PATH_DANGER = (0, 0, 255)
 COLOR_TEXT = (255, 255, 255)
 SHOW_LOW_CONFIDENCE_OVERLAY = True
+
+# ---------------- Debug view (debug_view.py + ui/debug_window.py) ----------------
+# True = open a second window next to the HUD showing, per frame: the raw
+# depth image, SegFormer's raw driveable probability and its per-pixel
+# class map, how semantics changed the depth segmentation, and height above
+# the fitted plane. Hover any panel for the exact values at that pixel.
+# Display only — never feeds brake/steer — but building it costs a few ms
+# per frame, so leave it off for normal running.
+DEBUG = True
+DEBUG_PANEL_WIDTH = 480              # px per panel; the window shows a 3x2 grid of these
+DEBUG_DEPTH_RANGE_M = (0.3, 15.0)    # depth colormap range (near -> far)
+DEBUG_HEIGHT_RANGE_M = 0.30          # height-above-plane colormap saturates here
+DEBUG_UPDATE_EVERY_N_FRAMES = 1      # raise if building the panels costs too much FPS
+
+# ---------------- Screen recording (ui/screen_recorder.py) ----------------
+# True = record the app's windows to video while it runs: the HUD, and the
+# debug window too when DEBUG is on — one file each, named
+# <start time>_hud.mp4 / <start time>_debug.mp4. Files are finalized when the
+# app is closed normally (window close button).
+RECORD_VIDEO = True
+RECORD_VIDEO_DIR = "recordings"
+RECORD_VIDEO_FPS = 15                 # wall-clock rate; frames are repeated if the UI is slower
+RECORD_VIDEO_CODEC = "mp4v"           # cv2 FOURCC — "mp4v" needs no extra codec install
+RECORD_VIDEO_EXT = "mp4"
 
 # ---------------- App window ----------------
 WINDOW_TITLE = "Tractor Vision — Perception & Control"

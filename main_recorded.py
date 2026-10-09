@@ -54,6 +54,7 @@ import numpy as np
 # This is why the import block below is split in two.
 import config
 import config_recorded
+import config_segformer
 
 config_recorded.apply()
 
@@ -64,6 +65,8 @@ import path_planner                                   # noqa: E402
 import vehicle_profile                                # noqa: E402
 from ar_ribbon import ArRibbon                        # noqa: E402
 from ground_segmentation import GroundSegmenter       # noqa: E402
+from segformer_onnx import SegformerOnnx              # noqa: E402
+import debug_view                                     # noqa: E402
 from object_tracker import ObstacleTracker            # noqa: E402
 from realsense_imu import ImuFusion, unavailable_state  # noqa: E402
 from shared_state import SharedState                  # noqa: E402
@@ -203,6 +206,12 @@ class RecordedVisionWorker:
         state.update(status_text="playback starting...")
         live._print_cpu_startup_info()
 
+        # Outside _Stateful on purpose: a model, not per-frame state. See
+        # config_segformer.py; unavailable -> pure-depth segmentation.
+        semantic_model = SegformerOnnx()
+        if not semantic_model.available:
+            print(f"[segformer] unavailable — pure-depth ground segmentation: {semantic_model.error}")
+
         # Nominal frame interval from the recording itself — used for the
         # single frame right after a cut, where there is no previous
         # timestamp to difference against and a dt of 0 would stall the
@@ -212,6 +221,7 @@ class RecordedVisionWorker:
 
         timing = _StageTiming()
         last_seen_capture_time = None
+        debug_frame_index = 0
 
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
@@ -240,8 +250,11 @@ class RecordedVisionWorker:
             reset_reason = self._take_reset()
             if reset_reason is not None:
                 stateful = self._Stateful()
+                # The model itself is kept (loading it is expensive) — only
+                # its reused-between-frames probability map is dropped.
+                semantic_model.reset()
                 print(f"[playback] {reset_reason}: per-frame state reset "
-                      f"(speed estimate, obstacle tracks, plane/mask smoothing, "
+                      f"(speed estimate, obstacle tracks, plane/mask/semantic smoothing, "
                       f"AR ribbon, brake/steer limiters)")
 
             if imu_state is not None:
@@ -267,11 +280,23 @@ class RecordedVisionWorker:
                 depth_image_m, xyz, raw_valid_mask, ir_image, pd
             )
 
+            proc_h, proc_w = depth_proc.shape[:2]
+            semantic_prob_proc = semantic_model.driveable_probability(
+                color_image, (proc_w, proc_h), want_class_ids=config.DEBUG)
+            # Stereo depth on featureless sky is garbage (phantom "obstacles"
+            # 1-2 m away, 1+ m up) — see SEMANTIC_SKY_MASK_ENABLED.
+            sky_proc = semantic_model.sky_mask((proc_w, proc_h))
+            if sky_proc is not None:
+                valid_proc = valid_proc & ~sky_proc
+            t1s = time.perf_counter()
+            timing.semantic += (t1s - t1)
+
             seg = stateful.ground_segmenter.segment(
-                depth_proc, xyz_proc, ir_image=ir_proc, raw_valid_mask=valid_proc
+                depth_proc, xyz_proc, ir_image=ir_proc, raw_valid_mask=valid_proc,
+                semantic_prob=semantic_prob_proc,
             )
             t2 = time.perf_counter()
-            timing.segment += (t2 - t1)
+            timing.segment += (t2 - t1s)
             land_mask_proc = seg["land_mask"]
             boundary_contour_proc = seg["boundary_contour"]
             dist_to_plane_proc = seg["dist_to_plane"]
@@ -348,6 +373,16 @@ class RecordedVisionWorker:
                 else boundary_contour_proc
             )
 
+            # Masked sky is a deliberate rejection, not untrusted sensor
+            # depth — keep it out of the low-confidence overlay.
+            raw_valid_display = raw_valid_mask
+            if sky_proc is not None and raw_valid_mask is not None:
+                raw_valid_display = raw_valid_mask & ~_upsample_mask_nearest(sky_proc, full_w, full_h, pd)
+
+            semantic_mask_full = None
+            if config_segformer.SEMANTIC_SHOW_OVERLAY and seg["semantic_ground"] is not None:
+                semantic_mask_full = _upsample_mask(seg["semantic_ground"], full_w, full_h, pd)
+
             ribbon = None
             if config.AR_ENABLED:
                 ribbon = stateful.ar_ribbon.update(
@@ -357,8 +392,8 @@ class RecordedVisionWorker:
             annotated = overlay.draw_annotations(
                 color_image, land_mask_full, boundary_contour_full, corridor_mask_full,
                 display_obstacles, brake_percent, steer_deg, path_result, speed_mps=speed_mps,
-                confidence_mask=confidence_mask_full, raw_valid_mask=raw_valid_mask,
-                ribbon=ribbon,
+                confidence_mask=confidence_mask_full, raw_valid_mask=raw_valid_display,
+                ribbon=ribbon, semantic_mask=semantic_mask_full,
             )
             if watchdog_triggered:
                 overlay.draw_watchdog_banner(annotated, degraded_duration)
@@ -366,6 +401,13 @@ class RecordedVisionWorker:
             if self.yolo_worker is not None:
                 self.yolo_worker.submit_frame(color_image)
                 live.draw_detections(annotated, state.get_yolo_detections())
+
+            if config.DEBUG:
+                if debug_frame_index % max(1, config.DEBUG_UPDATE_EVERY_N_FRAMES) == 0:
+                    state.update_debug(*debug_view.build(
+                        color_image, depth_image_m, raw_valid_mask, xyz_proc, seg,
+                        semantic_prob_proc, semantic_model))
+                debug_frame_index += 1
 
             t6 = time.perf_counter()
             timing.overlay += (t6 - t5)
@@ -435,7 +477,7 @@ class _StageTiming:
     """main.py's inline per-stage timing accumulators, as one object so
     the loop body above stays readable."""
 
-    _STAGES = ("capture", "segment", "speed", "obstacles", "path", "overlay", "state_update")
+    _STAGES = ("capture", "semantic", "segment", "speed", "obstacles", "path", "overlay", "state_update")
 
     def __init__(self):
         self.reset()
@@ -499,11 +541,15 @@ def _parse_args(argv=None):
     loop_group.add_argument("--no-loop", dest="loop", action="store_const", const=False,
                             help="hold on the last frame at the end")
     parser.add_argument("--no-yolo", action="store_true", help="skip object detection")
+    parser.add_argument("--debug", action="store_true",
+                        help="open the debug window (same as config.DEBUG = True)")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = _parse_args(argv)
+    if args.debug:
+        config.DEBUG = True
     folder = args.dir or config_recorded.resolve_recording_dir()
 
     if args.list:

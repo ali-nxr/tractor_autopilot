@@ -22,3 +22,16 @@ torch                 # required by ultralytics; install the CUDA build for
 # reason. Install via NVIDIA's own instructions for your exact CUDA
 # version: https://docs.nvidia.com/deeplearning/tensorrt/install-guide/
 # tensorrt
+
+# --- SegFormer semantic ground segmentation (see segformer_onnx.py) ---
+# Runtime: onnxruntime only. The GPU build includes the CPU provider, so it
+# works with or without an NVIDIA GPU. Without it the app degrades
+# gracefully to pure-depth ground segmentation.
+onnxruntime-gpu>=1.21   # >=1.21 for ort.preload_dlls() (finds CUDA/cuDNN DLLs on Windows)
+# One-time model export only (tools/export_segformer_onnx.py) — not needed
+# to run the app:
+# transformers
+# onnx
+# The TensorRT provider additionally needs NVIDIA's TensorRT runtime
+# (nvinfer) on PATH — same optional install as for YOLO above. Without it,
+# segformer_onnx.py uses CUDA.

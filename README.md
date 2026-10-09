@@ -1,5 +1,150 @@
 # Tractor Vision V2 — Perception Suite
 
+## V2.3 changes (SegFormer-guided ground segmentation)
+
+The depth-only ground segmentation fits ONE flat plane and accepts pixels
+within 4 cm of it. On rough terrain (ruts, furrows, bumps) that splits the
+ground into fragments that change from frame to frame. A SegFormer semantic
+model (ADE20K, run with **onnxruntime**) now guides it. Settings are in
+`config_segformer.py`, the backend is `segformer_onnx.py`, and the fusion is
+in `GroundSegmenter.segment()`.
+
+- **Plane seeding**: RANSAC is seeded only from pixels the model calls
+  driveable (road, grass, earth, field, dirt track, …), so the plane is fit
+  to the ground and not to crops or a vehicle.
+- **Rough-terrain relaxation**: semantic-ground pixels are accepted with a
+  larger height tolerance and a looser surface-normal check.
+- **Non-ground veto**: flat surfaces the model is confident are not ground
+  (e.g. water) are removed from land.
+- **Safety invariant**: the relaxed tolerance is clamped per pixel to the
+  obstacle height threshold (`obstacle_decision.height_threshold_m`), and
+  raised pixels are re-punched after the morphological cleanup. For the
+  same plane, the obstacle mask is therefore exactly what geometry alone
+  produces. Semantics cannot make braking less sensitive.
+
+**Setup (once):** export the model. This needs torch + transformers; the
+app itself needs only onnxruntime:
+
+    python tools/export_segformer_onnx.py            # -> models/segformer-b0-ade-512x512.onnx
+
+Without the model file (or with `SEGFORMER_ENABLED = False`), the app runs
+the previous pure-depth segmentation unchanged. Provider order is
+TensorRT (if the nvinfer runtime is installed) → CUDA → CPU. The
+`[timing]` log now has a `semantic=` stage.
+
+Measured on two recorded sequences (500 frames, RTX 3050 Laptop, CUDA):
+
+| | depth-only | SegFormer-guided |
+|---|---|---|
+| frame-to-frame land-mask IoU (mean) | 0.82 | 0.92–0.93 |
+| land coverage (mean) | 18–20 % | 29–32 % |
+| frames below the watchdog coverage limit | 5 | 0 |
+| obstacle blobs / frame | 3.1–3.5 | 3.0–3.4 |
+| model inference (isolated) | — | ~20 ms (b0, 512×512) |
+
+Inside the full app, the `semantic=` stage measures **70–110 ms**, not 20.
+This is GIL contention, not GPU speed. Inference alone is 18 ms, but 92 ms
+when another Python thread runs concurrently. In the app, the Tk UI,
+playback reader and YOLO threads hold the GIL inside long C calls.
+Lowering `sys.setswitchinterval` did not help in the app (measured).
+`SEGFORMER_RUN_EVERY_N_FRAMES` is the current lever; moving the model to its
+own process would remove the contention.
+
+### Stability tuning (land mask)
+
+Tuned on the same two recordings. The land mask used to flicker even
+though SegFormer's own mask was steady. The cause was isolated depth-noise
+pixels above the obstacle height threshold, each punching a hole that came
+and went, plus a fast EMA thresholded at exactly 0.5.
+
+- `SEMANTIC_ABSORB_DEPTH_SPECKLE = True` (config_segformer.py): on semantic
+  ground, only raised pixels that survive the obstacle detector's own 5x5
+  speckle opening (`obstacle_decision.open_raised`, shared by both) are
+  kept out of land. Opening is monotone and idempotent, so the obstacle
+  blobs are **identical**. Verified frame for frame on both recordings.
+- `SEMANTIC_NORMAL_MAX_ANGLE_DEG` 50 -> 75.
+- `LAND_MASK_TEMPORAL_SMOOTHING_ALPHA` 0.45 -> 0.3, plus new
+  `LAND_MASK_HYSTERESIS = 0.2` (on above 0.7, off below 0.3).
+
+| | before | after |
+|---|---|---|
+| frame-to-frame land IoU | 0.920 / 0.922 | **0.965 / 0.956** (SegFormer's own mask: 0.991 / 0.951) |
+| holes in the land mask (per frame) | 16.4 / 20.5 | **6.2 / 10.9** |
+| frames for a pixel to flip | 2 | 4 |
+
+The AR ribbon in the HUD does not use the land mask: `path_planner` builds
+it from valid depth plus confirmed obstacles. Its remaining jumps come from
+obstacles entering/leaving the corridor (blocked<->clear 21 times in 150
+frames on 145608), not from segmentation.
+
+### Path stability fixes (analysed from a recorded HUD session)
+
+A 394 s HUD recording of `20261007_143903` showed the AR ribbon flickering
+on/off ~every 3-4 frames, jumping sideways, spiking into the sky, and
+"NO DRIVABLE PATH" on a clear track. A replay of 900 frames attributed it:
+
+- **Sky phantoms.** Stereo depth on featureless sky returns points ~1.5-2 m
+  away and 1+ m up, thin but tall enough to pass the "post" obstacle rule.
+  They were 82% of all confirmed obstacles, the nearest *braking* obstacle in
+  634/900 frames (false braking), and caused 295/296 no-path frames.
+  `SEMANTIC_SKY_MASK_ENABLED` (config_segformer.py) now discards depth on
+  pixels SegFormer labels as sky.
+- **Near-band false block.** At ~1.5 m the camera sees a strip narrower than
+  the vehicle; a roadside obstacle outside the vehicle's corridor then made
+  `plan_path` report "blocked". A band is now blocked only if an obstacle is
+  inside the vehicle's own corridor.
+- **Ribbon.** Its ground-height grid ignores points >`AR_GROUND_MAX_DEV_M`
+  off the plane (no more spikes), and a brief no-data planner dropout keeps
+  the last ribbon for `AR_HOLD_DROPOUT_FRAMES` (a real block clears at once).
+
+| 900 frames of 143903 | before | after |
+|---|---|---|
+| ribbon shown | 67% | 99% |
+| ribbon on/off toggles | 338 | 2 |
+| frames with no path | 296 | 8 (real: 58 cm grass in the corridor margin) |
+| nearest braking obstacle is sky | 634 | 0 |
+| ribbon spikes | 57 | 0 |
+| path jumps > 0.5 m | 77 | 4 |
+
+Real (non-sky) corridor obstacles: 269 frames before, 272 after. Cost seen on
+`145707`: a distant tree-canopy blob (12-15 m, ~5 m tall) no longer reaches
+the corridor in 9/300 frames.
+
+### Screen recording (`config.RECORD_VIDEO = True`)
+
+Records the HUD window, and the debug window when `DEBUG` is on, to
+`recordings/<start time>_hud.mp4` and `..._debug.mp4` (`ui/screen_recorder.py`).
+Recording starts when the first processed frame is shown, so files do not
+open on the empty startup screen. It is written at `RECORD_VIDEO_FPS`
+(default 15) against the wall clock, so the video plays at real speed: when
+the app runs slower, frames are repeated. Each window records its own
+content even when another window covers it. Files are finalized when the
+app is closed with the window's close button. A killed process leaves an
+unplayable file. Capture costs ~5 ms per window per frame on the UI thread;
+encoding runs on a background thread.
+
+### Debug view (`config.DEBUG = True`, or `python main_recorded.py --debug`)
+
+Opens a second window next to the HUD with six pixel-aligned panels:
+
+1. camera + final land mask (coverage, how the plane was seeded, model status)
+2. **raw depth**: colour-mapped over `DEBUG_DEPTH_RANGE_M`; black = no depth;
+   dimmed = depth that exists only because an SDK filter filled a stereo hole
+3. **SegFormer raw output**: driveable probability before temporal
+   smoothing, with the decision threshold as a white line
+4. **SegFormer class map**: per-pixel ADE20K class with the top classes
+   listed (`*` = in `DRIVEABLE_CLASSES`). Use this to tune the class list.
+5. land source: kept by the depth test / added by semantics or cleanup /
+   vetoed by semantics / raised (obstacle candidate) / no valid depth
+6. height above the fitted plane
+
+Hover any panel for the exact values at that pixel (depth, raw-stereo
+validity, driveable probability, class name, height, land source), with
+a crosshair at the same point in every panel. It is display only. Building
+it costs ~20 ms/frame, so raise `DEBUG_UPDATE_EVERY_N_FRAMES` if that
+matters. The class map needs a model exported with the `class_ids` output
+(any export from `tools/export_segformer_onnx.py` from now on).
+
 ## V2.2 changes (FPS overhaul, segmentation accuracy, land analyzer removed)
 
 - **Land analyzer removed.** `agri_land_analyzer.py`, `models/agri_cnn.py`,

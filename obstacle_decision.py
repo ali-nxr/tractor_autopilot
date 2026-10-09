@@ -58,6 +58,19 @@ def build_raised_mask(dist_to_plane, valid_depth, land_mask, xyz=None):
     return (dist_to_plane > thr) & valid_depth & (~land_mask)
 
 
+def open_raised(raised_mask):
+    """
+    The speckle removal detect_obstacle_blobs applies to the raised mask
+    before labeling — a 5x5 elliptical MORPH_OPEN. Raised pixels this
+    removes can never be part of any obstacle blob. ground_segmentation.py
+    uses this SAME function to decide which raised pixels it may absorb
+    into land on semantic ground (depth-noise speckle), so the two can
+    never drift apart. Returns a uint8 0/1 mask.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    return cv2.morphologyEx(raised_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+
+
 def glare_mask(color_image, out_shape):
     """
     Blown-out bright pixels (specular reflections on glossy floors, water,
@@ -97,9 +110,7 @@ def detect_obstacle_blobs(raised_mask, xyz, dist_to_plane, untrusted_mask=None):
     """
     pd = config.PROCESSING_DOWNSCALE
     min_area = max(1, config.MIN_OBSTACLE_BLOB_AREA_PX // (pd * pd))
-    mask_u8 = raised_mask.astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    mask_u8 = open_raised(raised_mask)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
 
     x_all, z_all = xyz[..., 0], xyz[..., 2]

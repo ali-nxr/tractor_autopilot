@@ -256,9 +256,18 @@ def plan_path(land_mask, raised_mask, valid_depth, xyz, plane, intrinsics):
 
         runs = _find_clear_runs(free_bin, min_bins_for_width)
         if not runs:
-            if blocked_bin.any():
-                # Real raised/obstacle points are in this band and no
-                # tractor-width gap exists around them — genuinely blocked.
+            # Blocked only if an obstacle sits in the vehicle's OWN corridor
+            # (around the current heading). If every obstacle bin is outside
+            # it, the gap between them is wider than the vehicle — so the
+            # only reason no run fits is missing data (typically the first,
+            # barely visible band, where the camera sees a strip narrower
+            # than the vehicle). Measured on recording 20261007_143903: roadside
+            # grass 2 m to the side reported "blocked at 1.5 m" on a clear
+            # track this way. Braking never depended on this value.
+            in_corridor = np.abs(bin_centers - prev_x) < (half_tractor_width_m + config.CORRIDOR_MARGIN_M)
+            if (blocked_bin & in_corridor).any():
+                # Real raised/obstacle points in the vehicle's way and no
+                # tractor-width gap around them — genuinely blocked.
                 blocked_at_m = float(z_target)
                 break
             # No obstacle points at all — the gap is too narrow only
