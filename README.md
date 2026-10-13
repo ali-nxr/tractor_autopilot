@@ -1,5 +1,45 @@
 # Tractor Vision V2 — Perception Suite
 
+## Lane assist plugin (`lane_assist/`, `config_lane.py`)
+
+Detects the track's lanes / edges, **locks** the path to that corridor
+(instead of the default forward drivable-space search) and suggests a steer
+to follow it. Toggle with the **Lane Assist** button on the HUD (left panel)
+or `config_lane.LANE_ASSIST_ENABLED`. Requires `MULTIPROCESS_PIPELINE`.
+
+- **Modular:** a backend turns a frame into a `LaneEstimate` (lane lines,
+  road edges and planned path in a road-aligned frame, each with a
+  confidence). Everything after that is shared: corridor choice, lock,
+  steering, path, drawing. Add a model as `lane_assist/models/<name>.py` and
+  an entry in `config_lane.LANE_MODELS`.
+- **First backend: comma.ai openpilot supercombo**, run through the
+  `comma-operpilot` project (its runner, warp/packing and openpilot's own
+  parser). It ticks at the network's trained 20 Hz on the frame clock and
+  takes ~23 ms per frame in its own process.
+- **Camera calibration** (`config_lane` camera section): intrinsics come
+  from the stream or recording (overridable). Height, pitch and roll are
+  **measured every frame from the fitted ground plane** (overridable). Yaw
+  and the camera's position on the vehicle are set in config. The model's
+  metric output is rescaled by *true camera height / the model's own road
+  height*. That's exact for points on flat ground, and is needed because
+  openpilot was trained at ~1.2 m.
+- **Lock:** corridor priority is lane lines → road edges → plan. A corridor
+  must stay consistent for `LOCK_ACQUIRE_S` before it locks. While locked,
+  jumps over `LOCK_MAX_JUMP_M` count as misses, and after `LOCK_COAST_S` the
+  lock is dropped.
+- **Steering:** pure pursuit on the locked centreline from the rear axle
+  (`WHEELBASE_M`, speed-scaled lookahead).
+- **Safety:** braking is unchanged (depth obstacles only). The lane path is
+  checked for confirmed obstacles exactly like the normal path, and an
+  obstacle in the corridor overrides the lane steer with the
+  obstacle-avoidance steer.
+
+Measured on recordings: on `143903` (dirt track) it locked on road edges
+for 87% of frames once acquired (edge confidence ~0.7). On `145608`
+(tree-lined track) it locked for 82%, using road edges or the plan. Lane
+lines are ~0 on these unmarked tracks, as the comma-operpilot README also
+found.
+
 ## V2.3 changes (SegFormer-guided ground segmentation)
 
 The depth-only ground segmentation fits ONE flat plane and accepts pixels

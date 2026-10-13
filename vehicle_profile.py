@@ -53,8 +53,20 @@ def set_vehicle_size(width_m, length_m, save=True):
     config.TRACTOR_LENGTH_M = float(length_m)
     print(f"[vehicle] Size set: width={width_m:.3f} m ({width_m * FT_PER_M:.1f} ft), "
           f"length={length_m:.3f} m ({length_m * FT_PER_M:.1f} ft)")
+    for listener in list(_listeners):
+        # e.g. the multi-process pipeline forwarding the change to the
+        # process that actually runs path planning (mp_pipeline/app.py)
+        listener(float(width_m), float(length_m))
     if save:
         save_profile()
+
+
+_listeners = []
+
+
+def add_listener(callback):
+    """callback(width_m, length_m), called after every successful size change."""
+    _listeners.append(callback)
 
 
 def save_profile(path=None):

@@ -710,6 +710,10 @@ def main():
     # so the very first frame already uses the right width.
     vehicle_profile.load_profile()
 
+    if config.MULTIPROCESS_PIPELINE:
+        from mp_pipeline import app as mp_app
+        return mp_app.run("live", yolo=config.YOLO_ENABLED)
+
     shared_state = SharedState()
 
     yolo_worker = YoloWorker(shared_state)

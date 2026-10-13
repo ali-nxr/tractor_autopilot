@@ -53,6 +53,9 @@ class SharedState:
         self.yolo_detections = []
         self.yolo_status = "not started"
 
+        # --- lane assist (lane_assist/; None when the plugin is not loaded) ---
+        self.lane = None
+
         # --- debug view (config.DEBUG only; see debug_view.py) ---
         self.debug_frame = None          # BGR panel grid
         self.debug_probe = None          # per-pixel values behind it, for the mouse readout
@@ -135,6 +138,7 @@ class SharedState:
                 "imu": dict(self.imu),
                 "yolo_detections": list(self.yolo_detections),
                 "yolo_status": self.yolo_status,
+                "lane": dict(self.lane) if self.lane else None,
             }
 
     def snapshot_history(self):

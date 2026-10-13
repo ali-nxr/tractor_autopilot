@@ -214,7 +214,7 @@ class PlaybackController:
 
     # ------------------------------------------------------- reader thread
 
-    def next_frame(self):
+    def next_frame(self, decode=True):
         """
         Block until the next frame should be delivered, then read it.
 
@@ -231,7 +231,7 @@ class PlaybackController:
             self._pace()
 
         try:
-            frames, meta = self.source.read_frames()
+            frames, meta = self.source.read_frames(decode=decode)
         except PlaybackEnded:
             with self._wake:
                 self._at_end = True

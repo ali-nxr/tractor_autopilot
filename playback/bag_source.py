@@ -454,9 +454,15 @@ class RealSenseBagSource:
 
     # -------------------------------------------------------------- frames
 
-    def read_frames(self):
+    def read_frames(self, decode=True):
         """
         The next recorded frameset, as (frames_tuple, meta).
+
+        decode=False advances past the frameset WITHOUT the expensive work
+        (alignment, depth filters, copies): frames_tuple is None, but the
+        timeline, wrap detection and IMU integration still advance. Used by
+        streaming playback to skip frames the pipeline cannot take — the
+        same frames a live camera would drop.
 
         frames_tuple is exactly what a live RealSenseCapture.get_frames()
         returns: (color_image, depth_image_m, xyz, ir_image,
@@ -498,7 +504,11 @@ class RealSenseBagSource:
             if not self.options.loop:
                 raise PlaybackEnded("reached the end of the recording")
 
-        frames = self._prepare(frameset, wrapped)
+        if decode:
+            frames = self._prepare(frameset, wrapped)
+        else:
+            frames = None
+            self._advance_without_decoding(frameset, wrapped)
         self.frame_index += 1
 
         meta = {
@@ -568,6 +578,15 @@ class RealSenseBagSource:
 
         xyz = self._deproject(depth_image_m)
         return color_image, depth_image_m, xyz, ir_image, raw_valid_mask, imu_state
+
+    def _advance_without_decoding(self, frameset, wrapped):
+        """The bookkeeping half of _prepare (recording clock + IMU), so a
+        skipped frame still moves time and the attitude filter forward."""
+        timestamp_s = frameset.get_timestamp() / 1000.0
+        if self._first_frame_time_s is None or wrapped:
+            self._first_frame_time_s = timestamp_s
+        self._last_frame_time_s = timestamp_s
+        self._read_imu(frameset, timestamp_s, wrapped)
 
     def _to_array(self, frame):
         """

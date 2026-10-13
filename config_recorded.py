@@ -35,7 +35,7 @@ RECORDING_DIR = r"D:\tractor_realsense_data"
 # Which sequence to play. None = pick automatically (see PREFER below).
 # Otherwise: a full path, a folder index ("0", "1"), or any part of the
 # file name ("145904"). The --file command-line argument overrides this.
-SEQUENCE = 145707
+SEQUENCE = None
 # Used only when SEQUENCE is None: "longest" (most footage to look at),
 # "first", or "last".
 PREFER = "longest"
@@ -55,6 +55,10 @@ PLAYBACK_SPEED = 0.0
 # consumer). Only set True if holding a chosen speed matters more than
 # seeing every frame.
 PLAYBACK_DROP_FRAMES = False
+# (--stream on the command line = PLAYBACK_DROP_FRAMES True at speed 1.0:
+# "streaming" playback that behaves like the live camera — real-time, and
+# only the frames the pipeline can take are decoded at all. Multi-process
+# pipeline only; not deterministic, it depends on this machine's speed.)
 PLAYBACK_SKIP_SECONDS = 5.0           # the -5s / +5s buttons
 
 # ---------------- What to pull out of the recording ----------------

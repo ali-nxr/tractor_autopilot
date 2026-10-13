@@ -97,6 +97,7 @@ PROCESSING_DOWNSCALE = 2
 # ---------------- Ground segmentation (RANSAC plane fit) ----------------
 GROUND_SEED_ROW_FRACTION = 0.45      # bottom fraction of the frame used to seed the fit
 RANSAC_ITERATIONS = 400              # fully vectorized — see ground_segmentation.py
+GROUND_RANSAC_SEED = None            # int = repeatable RANSAC (testing); None = random
 RANSAC_INLIER_THRESHOLD_M = 0.04     # a point within 4cm of the fitted plane = "ground"
 RANSAC_MIN_SAMPLE_POINTS = 300
 RANSAC_SUBSAMPLE_POINTS = 4000
@@ -264,6 +265,15 @@ YOLO_MIN_INTERVAL_S = 0.3
 # the main vision loop's own CPU-bound numpy/OpenCV work for actual CPU
 # cycles, on top of the separate GIL-contention issue above.
 YOLO_TORCH_CPU_THREADS = 2
+
+# ---------------- Multi-process pipeline (mp_pipeline/) ----------------
+# True = capture, SegFormer, geometry (segmentation/obstacles/path/brake),
+# render and YOLO each run in their OWN process, passing frames through
+# shared memory — stages run in parallel instead of taking turns on
+# Python's GIL. False = the original single-process threaded loops in
+# main.py / main_recorded.py (kept as a fallback and for comparison).
+MULTIPROCESS_PIPELINE = True
+MP_RING_SLOTS = 4                    # frames in flight (~8 MB each at 1280x720); more = more queueing latency
 
 # ---------------- CPU threading limits (avoid oversubscription) ----------------
 # See main.py's _limit_cv2_threads(). OpenCV defaults to auto-threading

@@ -22,9 +22,14 @@ from ui.widgets import AttitudeIndicator, ArcGauge, SteerBar, Sparkline, StatusD
 
 
 class TractorVisionApp:
-    def __init__(self, shared_state, on_close=None, on_imu_zero=None):
+    def __init__(self, shared_state, on_close=None, on_imu_zero=None, on_lane_toggle=None,
+                 lane_initially_on=False):
         self.state = shared_state
         self.on_close = on_close
+        # Lane assist plugin (lane_assist/): on_lane_toggle(bool) switches it
+        # in the pipeline; None = plugin not loaded, no lane controls shown.
+        self._on_lane_toggle = on_lane_toggle
+        self._lane_on = bool(lane_initially_on)
 
         self.root = tk.Tk()
         self.root.title(config.WINDOW_TITLE)
@@ -167,6 +172,60 @@ class TractorVisionApp:
                  font=theme.FONT_LABEL_BOLD).pack(anchor="w", padx=theme.PAD_LG, pady=(theme.PAD_LG, 4))
         self.tilt_spark = Sparkline(panel, width=245, height=36, color=theme.IMU_ACCENT, bg=theme.PANEL_BG)
         self.tilt_spark.pack(padx=theme.PAD_LG)
+
+        if self._on_lane_toggle is not None:
+            self._build_lane_panel(panel)
+
+    def _build_lane_panel(self, panel):
+        """Lane assist on/off + what it is doing (searching / locked on
+        road edges / lane lines / plan, its steer suggestion)."""
+        tk.Label(panel, text="LANE ASSIST", fg=theme.TEXT_DIM, bg=theme.PANEL_BG,
+                 font=theme.FONT_LABEL_BOLD).pack(anchor="w", padx=theme.PAD_LG, pady=(theme.PAD_LG, 4))
+        card = tk.Frame(panel, bg=theme.CARD_BG, highlightbackground=theme.BORDER, highlightthickness=1)
+        card.pack(padx=theme.PAD_LG, fill=tk.X)
+        self.lane_button = tk.Button(card, command=self._toggle_lane, relief=tk.FLAT,
+                                     font=theme.FONT_LABEL_BOLD, padx=10, pady=4)
+        self.lane_button.pack(fill=tk.X, padx=8, pady=(8, 4))
+        self.lane_status_label = tk.Label(card, text="", fg=theme.TEXT_FAINT, bg=theme.CARD_BG,
+                                          font=theme.FONT_LABEL, wraplength=230, justify="left")
+        self.lane_status_label.pack(anchor="w", padx=8, pady=(0, 8))
+        self._style_lane_button()
+
+    def _style_lane_button(self):
+        if self._lane_on:
+            self.lane_button.configure(text="Lane Assist: ON", bg=theme.ACCENT, fg="#1a1000",
+                                       activebackground=theme.ACCENT_DIM)
+        else:
+            self.lane_button.configure(text="Lane Assist: OFF", bg=theme.PANEL_BG, fg=theme.TEXT,
+                                       activebackground=theme.BORDER)
+
+    def _toggle_lane(self):
+        self._lane_on = not self._lane_on
+        self._on_lane_toggle(self._lane_on)
+        self._style_lane_button()
+
+    def _update_lane_status(self, lane):
+        if not hasattr(self, "lane_status_label"):
+            return
+        if lane is None or not self._lane_on:
+            self.lane_status_label.configure(text="Follows the drivable space ahead", fg=theme.TEXT_FAINT)
+            return
+        if lane.get("model_error"):
+            self.lane_status_label.configure(text=f"Unavailable: {lane['model_error'][:80]}", fg=theme.DANGER)
+            return
+        state = lane.get("state")
+        if state in ("LOCKED", "COASTING"):
+            steer = lane.get("steer_deg")
+            steer_txt = "--" if steer is None else ("straight" if abs(steer) < 0.5
+                                                    else f"{'right' if steer > 0 else 'left'} {abs(steer):.0f}°")
+            off = lane.get("offset_m")
+            off_txt = "" if off is None else f"  offset {off:+.2f} m"
+            self.lane_status_label.configure(
+                text=f"{state.title()} on {(lane.get('kind') or '').replace('_', ' ')} "
+                     f"(conf {lane.get('conf', 0):.2f})\nSteer {steer_txt}{off_txt}",
+                fg=theme.GOOD if state == "LOCKED" else theme.WARN)
+        else:
+            self.lane_status_label.configure(text="Searching for a lane…", fg=theme.TEXT_DIM)
 
     def _mini_readout(self, parent, title, col):
         colframe = tk.Frame(parent, bg=theme.CARD_BG)
@@ -399,6 +458,7 @@ class TractorVisionApp:
                 text=imu.get("status", "unavailable"), fg=theme.TEXT_FAINT
             )
         self.tilt_spark.set(history.get("tilt_deg", []))
+        self._update_lane_status(snap.get("lane"))
 
         # --- speed / brake / steer ---
         speed_kmh = snap["speed_mps"] * 3.6

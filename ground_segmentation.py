@@ -329,7 +329,9 @@ class GroundSegmenter:
     """
 
     def __init__(self):
-        self._rng = np.random.default_rng()
+        # GROUND_RANSAC_SEED: None = a fresh random stream (normal running);
+        # an int makes runs repeatable, for comparing two pipeline variants.
+        self._rng = np.random.default_rng(config.GROUND_RANSAC_SEED)
         self._smoothed_plane = None
         self._miss_count = 0
         self._land_prob = None   # running per-pixel EMA of the land classification

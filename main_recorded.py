@@ -515,8 +515,9 @@ def _build_playback_options(args, info):
         ir_stream_index=config.IR_STREAM_INDEX,
         loop=(config_recorded.PLAYBACK_LOOP if args.loop is None else args.loop),
         start_paused=(config_recorded.PLAYBACK_START_PAUSED or args.paused),
-        speed=(config_recorded.PLAYBACK_SPEED if args.speed is None else args.speed),
-        drop_frames=config_recorded.PLAYBACK_DROP_FRAMES,
+        speed=(args.speed if args.speed is not None
+               else 1.0 if getattr(args, "stream", False) else config_recorded.PLAYBACK_SPEED),
+        drop_frames=config_recorded.PLAYBACK_DROP_FRAMES or getattr(args, "stream", False),
         use_recorded_timebase=config_recorded.PLAYBACK_RECORDED_TIMEBASE,
     )
 
@@ -541,6 +542,9 @@ def _parse_args(argv=None):
     loop_group.add_argument("--no-loop", dest="loop", action="store_const", const=False,
                             help="hold on the last frame at the end")
     parser.add_argument("--no-yolo", action="store_true", help="skip object detection")
+    parser.add_argument("--stream", action="store_true",
+                        help="streaming playback: real-time (speed 1 unless --speed is given), "
+                             "decoding only the frames the pipeline can take, like a live camera")
     parser.add_argument("--debug", action="store_true",
                         help="open the debug window (same as config.DEBUG = True)")
     return parser.parse_args(argv)
@@ -576,6 +580,12 @@ def main(argv=None):
     # vehicle size so the very first frame uses the right corridor width.
     live._limit_cv2_threads()
     vehicle_profile.load_profile()
+
+    if config.MULTIPROCESS_PIPELINE:
+        from mp_pipeline import app as mp_app
+        return mp_app.run("recorded", (_build_playback_options(args, info), info),
+                          yolo=config.YOLO_ENABLED and not args.no_yolo,
+                          show_playback_bar=config_recorded.PLAYBACK_SHOW_CONTROLS)
 
     shared_state = SharedState()
 
